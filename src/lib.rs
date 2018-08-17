@@ -1,10 +1,15 @@
 #![no_std]
+#![feature(nll)]
 
-extern crate os_bootinfo;
+pub extern crate x86_64;
+extern crate usize_conversions;
 
-pub mod bootinfo {
-    pub use os_bootinfo::*;
-}
+#[allow(dead_code)]
+pub mod bootinfo;
+
+// pub mod bootinfo {
+//     pub use boot_info::*;
+// }
 
 /// Defines the entry point function.
 ///

@@ -9,7 +9,6 @@
 #![no_std]
 #![no_main]
 
-extern crate os_bootinfo;
 extern crate usize_conversions;
 extern crate x86_64;
 extern crate xmas_elf;
@@ -18,10 +17,10 @@ extern crate fixedvec;
 
 use core::slice;
 use core::panic::PanicInfo;
-use os_bootinfo::BootInfo;
+use bootinfo::BootInfo;
 use usize_conversions::usize_from;
 use x86_64::structures::paging::{Mapper, RecursivePageTable};
-use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size2MiB};
+use x86_64::structures::paging::{Page, PageTableFlags, PhysFrame, Size4KiB, Size2MiB};
 use x86_64::ux::u9;
 pub use x86_64::PhysAddr;
 use x86_64::VirtAddr;
@@ -35,7 +34,7 @@ extern "C" {
     fn context_switch(boot_info: VirtAddr, entry_point: VirtAddr, stack_pointer: VirtAddr) -> !;
 }
 
-mod boot_info;
+mod bootinfo;
 mod frame_allocator;
 mod page_table;
 mod printer;
@@ -66,14 +65,15 @@ pub extern "C" fn load_elf(
     page_table_end: PhysAddr,
     bootloader_start: PhysAddr,
     bootloader_end: PhysAddr,
+    package_size: u64,
 ) -> ! {
     use fixedvec::FixedVec;
-    use os_bootinfo::{MemoryRegion, MemoryRegionType};
+    use bootinfo::{MemoryRegion, MemoryRegionType};
     use xmas_elf::program::{ProgramHeader, ProgramHeader64};
 
     printer::Printer.clear_screen();
 
-    let mut memory_map = boot_info::create_from(memory_map_addr, memory_map_entry_count);
+    let mut memory_map = bootinfo::create_from(memory_map_addr, memory_map_entry_count);
 
     // Extract required information from the ELF file.
     let mut preallocated_space = alloc_stack!([ProgramHeader64; 32]);
@@ -117,36 +117,51 @@ pub extern "C" fn load_elf(
         memory_map: &mut memory_map,
     };
 
+    let package_start = {
+        let padding = (512 - (kernel_size % 512)) % 512;
+        IdentityMappedAddr(PhysAddr::new(kernel_start.as_u64() + kernel_size + padding))
+    };
 
     // Mark already used memory areas in frame allocator.
     {
         let zero_frame: PhysFrame = PhysFrame::from_start_address(PhysAddr::new(0)).unwrap();
         frame_allocator.mark_allocated_region(MemoryRegion {
-            range: PhysFrame::range(zero_frame, zero_frame + 1).into(),
+            range: PhysFrame::range(zero_frame, zero_frame + 1),
             region_type: MemoryRegionType::FrameZero,
         });
+
         let bootloader_start_frame = PhysFrame::containing_address(bootloader_start);
         let bootloader_end_frame = PhysFrame::containing_address(bootloader_end - 1u64);
         let bootloader_memory_area =
             PhysFrame::range(bootloader_start_frame, bootloader_end_frame + 1);
         frame_allocator.mark_allocated_region(MemoryRegion {
-            range: bootloader_memory_area.into(),
+            range: bootloader_memory_area,
             region_type: MemoryRegionType::Bootloader,
         });
+
         let kernel_start_frame = PhysFrame::containing_address(kernel_start.phys());
         let kernel_end_frame =
             PhysFrame::containing_address(kernel_start.phys() + kernel_size - 1u64);
         let kernel_memory_area = PhysFrame::range(kernel_start_frame, kernel_end_frame + 1);
         frame_allocator.mark_allocated_region(MemoryRegion {
-            range: kernel_memory_area.into(),
+            range: kernel_memory_area,
             region_type: MemoryRegionType::Kernel,
         });
+
+        let package_start_frame = PhysFrame::containing_address(package_start.phys()) + 1;
+        let package_end_frame = PhysFrame::containing_address(package_start.phys() + package_size - 1u64);
+        let package_memory_area = PhysFrame::range(package_start_frame, package_end_frame + 1);
+        frame_allocator.mark_allocated_region(MemoryRegion {
+            range: package_memory_area.into(),
+            region_type: MemoryRegionType::Package,
+        });
+
         let page_table_start_frame = PhysFrame::containing_address(page_table_start);
         let page_table_end_frame = PhysFrame::containing_address(page_table_end - 1u64);
         let page_table_memory_area =
             PhysFrame::range(page_table_start_frame, page_table_end_frame + 1);
         frame_allocator.mark_allocated_region(MemoryRegion {
-            range: page_table_memory_area.into(),
+            range: page_table_memory_area,
             region_type: MemoryRegionType::PageTable,
         });
     }
@@ -168,6 +183,21 @@ pub extern "C" fn load_elf(
         &mut frame_allocator,
     ).expect("kernel mapping failed");
 
+    {
+        let package_start_page: Page<Size4KiB> = Page::containing_address(package_start.virt());
+        let package_end_page = Page::containing_address(package_start.virt() + package_size - 1u64);
+        let package_start_frame = PhysFrame::containing_address(package_start.phys());
+        let package_end_frame = PhysFrame::containing_address(package_start.phys() + package_size - 1u64);
+        let page_iter = Page::range_inclusive(package_start_page, package_end_page);
+        let frame_iter = PhysFrame::range_inclusive(package_start_frame, package_end_frame);
+        for (frame, page) in frame_iter.zip(page_iter) {
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        page_table::map_page(page, frame, flags, &mut rec_page_table, &mut frame_allocator)
+            .expect("Unable to map page")
+            .flush();
+        }
+    }
+
     // Map a page for the boot info structure
     let boot_info_page = {
         let page: Page = Page::containing_address(VirtAddr::new(0xb0071f0000));
@@ -185,8 +215,10 @@ pub extern "C" fn load_elf(
         page
     };
 
+    let package_slice = unsafe { slice::from_raw_parts(package_start.as_u64() as *const u8, package_size as usize) };
+
     // Construct boot info structure.
-    let mut boot_info = BootInfo::new(recursive_page_table_addr.start_address().as_u64(), memory_map);
+    let mut boot_info = BootInfo::new(recursive_page_table_addr.start_address().as_u64(), memory_map, package_slice);
     boot_info.memory_map.sort();
 
     // Write boot info to boot info page.

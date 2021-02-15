@@ -1,4 +1,4 @@
-cargo-features = ["publish-lockfile"]
+
 
 [package]
 name = "bootloader"
